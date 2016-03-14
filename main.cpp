@@ -2,7 +2,6 @@
 #include <cmath>
 #include <iostream>
 #include <stddef.h>
-#include "fourier.hpp"
 #include <omp.h>
 #include <fstream>
 #include <fftw3.h>
@@ -12,7 +11,7 @@
 #include <cassert>
 #include <thread>
 
-const int N = 512;
+const int N = 1024;
 static std::thread last_thread;
 double white_val;
 
@@ -24,15 +23,15 @@ void save(const char* fn, std::complex<double>* g)
 	white_val = 0.0;
 	#pragma omp parallel for reduction(max:white_val)
 	for(int i = 0; i < N * N; i++)
-		white_val = fmax(white_val, (g[i] * std::conj(g[i])).real());
+		white_val = fmax(white_val, std::abs(g[i]));
 	
 	std::cout << white_val << std::endl;
 	
-	unsigned char* buffer = new unsigned char[N * N];
+	unsigned char* buffer = new unsigned char[3 * N * N];
 	double over_white = 1.0 / white_val;
 	#pragma omp parallel for
 	for(int i = 0; i < N * N; i++)
-		buffer[i] = fmin(255.0, 255.0 * (g[i] * std::conj(g[i])).real() * over_white);
+		buffer[i] = fmin(255.0, 255.0 * std::abs(g[i]) * over_white);
 	
 	std::string fncp = fn;
 	last_thread = std::thread([buffer, fncp]()
@@ -69,7 +68,7 @@ int main()
 	memset(e, 0, sizeof(std::complex<double>) * N * N);
 	
 	const double lambda = 500.0e-9;
-	const double dz = 1.0;
+	const double dz = 1.0e-6;
 	const double n = 1.0; 
 	const double k0 = 2.0 * M_PI / lambda;
 	const double grid_size = 0.25 * lambda * N;
@@ -86,12 +85,14 @@ int main()
 	{
 		for(int x = 0; x < N; x++)
 		{
-			int dx = x - N / 2;
+			int dx = x - N / 2 + 300;
 			int dy = y - N / 2;
 			
 			e[y * N + x]=std::exp(-(dx * dx + dy * dy) / 60.0);
 		}
 	}
+	
+	save("out.jpg", e);
 	
 	int saven = 0;
 	double start = omp_get_wtime();
@@ -104,15 +105,7 @@ int main()
 		{
 			for(int x = 0; x < N; x++)
 			{
-				int dx = x - N / 2;
-				int dy = y - N / 2;
-				
-				if(dx * dx + dy * dy > 200 * 200)
-				{
-					e[y * N + x] = 0;
-				}
-				else
-					e[y * N + x] *= r;
+				e[y * N + x] *= r;
 			}
 		}
 		
@@ -124,7 +117,18 @@ int main()
 			for(int x = 0; x < N; x++)
 			{
 				double kx = (x - N / 2) * over_grid_size;
+				if(x > N / 2)
+					kx = (x - N) * over_grid_size;
+				else
+					kx = x * over_grid_size;
+				
 				double ky = (y - N / 2) * over_grid_size;
+				
+				if(y > N / 2)
+					ky = (y - N) * over_grid_size;
+				else
+					ky = y * over_grid_size;
+				
 				double kz = std::sqrt(k0 * k0 - kx * kx - ky * ky);
 				
 				double phi = -dz * kz;
@@ -135,7 +139,7 @@ int main()
 		
 		fftw_execute(backwards);
 		
-		if(i % 1 == 0)
+		if(i % 5 == 0)
 		{
 			char str[100];
 			sprintf(str, "out/img%d.jpg\n", saven++);
