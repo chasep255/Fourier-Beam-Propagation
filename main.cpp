@@ -75,7 +75,7 @@ int main()
 	const double over_grid_size = 1.0 / grid_size;
 	const double over_N2 = 1.0 / (N * N);
 	
-	const int ITS = 300000;
+	const int ITS = 100;
 	
 	fftw_plan forwards = fftw_plan_dft_2d(N, N, (fftw_complex*)e, (fftw_complex*)e_prime, FFTW_FORWARD, FFTW_MEASURE);
 	fftw_plan backwards = fftw_plan_dft_2d(N, N, (fftw_complex*)e_prime, (fftw_complex*)e, FFTW_BACKWARD, FFTW_MEASURE);
@@ -85,12 +85,23 @@ int main()
 	{
 		for(int x = 0; x < N; x++)
 		{
-			int dx = x - N / 2 + 300;
+			int dx = x - N / 2;
 			int dy = y - N / 2;
 			
-			e[y * N + x]=std::exp(-(dx * dx + dy * dy) / 60.0);
+			if(dx * dx + dy * dy < 100 * 100)
+				e[y * N + x] = 1.0;
+			else
+				e[y * N + x] = 0.0;
+//			
+//			e[y * N + x]=std::exp(-(dx * dx + dy * dy) / 60.0);
+			
+//			if((x == 900 || x == 1100) && y >= 900 && y < 1100)
+//				e[y * N + x] = 1.0;
+//			else
+//				e[y * N + x] = 0.0;
 		}
 	}
+	
 	
 	save("out.jpg", e);
 	
@@ -139,7 +150,7 @@ int main()
 		
 		fftw_execute(backwards);
 		
-		if(i % 5 == 0)
+		if(i % 2 == 0)
 		{
 			char str[100];
 			sprintf(str, "out/img%d.jpg\n", saven++);
