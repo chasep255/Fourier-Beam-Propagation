@@ -5,46 +5,28 @@
 #include <string>
 #include <cufft.h>
 #include <sys/time.h>
+#include <thread>
 #include "FourierBeamPropagator.cuh"
+#include "OpticalElements.cuh"
+#include <gtk/gtk.h>
+#include <thread>
+#include <cstdlib>
+#include "DoubleBuffer.hpp"
 
-typedef double real;
+typedef float real;
 typedef thrust::complex<real> complex;
 
-const int N = 2048;
-const int ITS = 10000;
-const double lambda = 500.0e-9;
-const double dz = 1.0e-6;
-const double n = 1.0; 
-const double k0 = 2.0 * M_PI / lambda;
-const double grid_size = 0.25 * lambda * N;
-const double over_grid_size = 1.0 / grid_size;
-const double over_N2 = 1.0 / (N * N);
+const int CELLS = 1024 * 4;
+const real LAMBDA = 500.0e-9;
+const real DZ = LAMBDA;
+const real CELL_DIM = LAMBDA;
+const real MAX_N_CHANGE = 0.005;
+const bool ADJUST_STEP = true;
+const int RENDER_EVERY = 3;
 
-real white_value = 0.25;
-
-void save(const char* fn, complex* g)
-{	
-	unsigned char* buffer = new unsigned char[N * N];
-	
-//	for(int i = 0; i < N * N; i++)
-//		white_value = fmax(white_value, thrust::abs(g[i]));
-//	std::cout << white_value << std::endl;
-	real over_white = 1.0 / white_value;
-	
-	
-	for(int i = 0; i < N * N; i++)
-		buffer[i] = fmin(255.0, 255.0 * thrust::abs(g[i]) * over_white);
-	
-	std::string cmd = std::string("convert /dev/stdin ") + fn;
-	FILE* out = popen(cmd.c_str(), "w");
-	
-	fprintf(out, "P5 %d %d 255 ", N, N);
-	
-	fwrite(buffer, 1, N * N, out);
-	
-	delete[] buffer;
-	fclose(out);
-}
+typedef BiConvexLens<real> OpticalPath;
+OpticalPath op(0.001, 0.005, 0.001, 1.3);
+fftbpm::BeamPropagator<real, OpticalPath>* prop = nullptr;
 
 inline void cucheck()
 {
@@ -55,56 +37,6 @@ inline void cucheck()
 	}
 }
 
-void initE(complex* efld)
-{
-	for(int y = 0; y < N; y++)
-	{
-		for(int x = 0; x < N; x++)
-		{
-			int dx = x - N / 2;
-			int dy = y - N / 2;
-//			
-//			if(dx * dx + dy * dy < 100 * 100)
-//				efld[y * N + x] = 1.0;
-//			else
-//				efld[y * N + x] = 0.0;
-//			
-//			efld[y * N + x] = exp(-(dx * dx + dy * dy) / 60.0);
-			
-			if((x == 900 || x == 1100) && y >= 900 && y < 1100)
-				efld[y * N + x] = 1.0;
-			else
-				efld[y * N + x] = 0.0;
-		}
-	}
-}
-
-__global__ void refraction_kernel(complex* efld)
-{
-	int idx = blockIdx.x * blockDim.x + threadIdx.x;
-	int idy = blockIdx.y * blockDim.y + threadIdx.y;
-	if(idx < N && idy < N)
-	{
-		efld[idy * N + idx] *= thrust::exp(complex(0.0, -n * dz * k0));
-	}
-}
-
-__global__ void diffraction_kernel(complex* efld_fft)
-{
-	int idx = blockIdx.x * blockDim.x + threadIdx.x;
-	int idy = blockIdx.y * blockDim.y + threadIdx.y;
-	if(idx < N && idy < N)
-	{
-		real kx = idx > N / 2 ? (idx - N) * over_grid_size : idx * over_grid_size;
-		real ky = idy > N / 2 ? (idy - N) * over_grid_size : idy * over_grid_size;
-		real kz = sqrt(k0 * k0 - kx * kx - ky * ky);
-		real phi = -dz * kz;
-		real re, im;
-		sincos(phi, &im, &re);
-		efld_fft[idy * N + idx] *= complex(re * over_N2, im * over_N2);
-	}
-}
-
 double prof_time()
 {
 	struct timeval now;
@@ -112,79 +44,231 @@ double prof_time()
 	return now.tv_sec + 1.0e-6 * now.tv_usec;
 }
 
-int main()
+const int STRIDE = cairo_format_stride_for_width(CAIRO_FORMAT_RGB24, 2 * CELLS);
+DoubleBuffer<unsigned char> render_buffer(STRIDE * CELLS);
+volatile int total_steps = 0;
+volatile real current_z = 0.0;
+volatile bool quit_thread = false; 
+volatile bool changed = true;
+void stepper_thread()
 {
+	static std::thread t;
+	long long count = 0;
 	
-	cudaSetDevice(0);
-	complex* elec_fld = new complex[N * N];
-	initE(elec_fld);
+	cudaSetDevice(prop->getDevice());
 	
-	complex* elec_fld_d;
-	complex* elec_fft_d;
-	cudaMalloc(&elec_fld_d, sizeof(complex) * N * N);
-	cucheck();
-	
-	cudaMalloc(&elec_fft_d, sizeof(complex) * N * N);
-	cucheck();
-	
-	cufftHandle plan;
-	if(cufftPlan2d(&plan, N, N, CUFFT_Z2Z) != CUFFT_SUCCESS)
-		exit(1);
-	
-	cudaMemcpy(elec_fld_d, elec_fld, sizeof(complex) * N * N, cudaMemcpyHostToDevice);
-	cucheck();
-	
-	int refraction_threads;
-	int refraction_blocks;
-	int diffraction_threads;
-	int diffraction_blocks;
-	
-	cudaFuncAttributes attrs;
-	cudaFuncGetAttributes(&attrs, diffraction_kernel);
-	cucheck();
-	refraction_threads = sqrt(attrs.maxThreadsPerBlock);
-	refraction_blocks = (N + (refraction_threads - 1)) / refraction_threads;
-	
-	cudaFuncGetAttributes(&attrs, diffraction_kernel);
-	cucheck();
-	diffraction_threads = sqrt(attrs.maxThreadsPerBlock);
-	diffraction_blocks = (N + (diffraction_threads - 1)) / diffraction_threads;
-	
-	std::cout << diffraction_threads << "\t" << diffraction_blocks << std::endl;
-	std::cout << diffraction_threads << "\t" << diffraction_blocks << std::endl;
-	
-	save("pattern.jpg", elec_fld);
-	
-	std::cout << sizeof(cufftDoubleComplex) << "\t" << sizeof(complex) << std::endl;
-	int file_number = 0;
-	double start = prof_time();
-	for(int i = 0; i < ITS; i++)
+	while(!quit_thread)
 	{
-		std::cout << i << std::endl;
-		refraction_kernel<<< dim3(refraction_blocks, refraction_blocks), dim3(refraction_threads, refraction_threads) >>>(elec_fld_d);
-		cucheck();
-		if(cufftExecZ2Z(plan, (cufftDoubleComplex*)elec_fld_d, (cufftDoubleComplex*)elec_fft_d, CUFFT_FORWARD) != CUFFT_SUCCESS)
-			exit(1);
-		diffraction_kernel<<< dim3(diffraction_blocks, diffraction_blocks), dim3(diffraction_threads, diffraction_threads) >>>(elec_fft_d);
-		cucheck();
-		if(cufftExecZ2Z(plan, (cufftDoubleComplex*)elec_fft_d, (cufftDoubleComplex*)elec_fld_d, CUFFT_INVERSE) != CUFFT_SUCCESS)
-			exit(1);
+		prop->step(DZ, ADJUST_STEP);
 		
-		if(i % 4 == 0)
+		if(count % RENDER_EVERY == 0)
 		{
-			cucheck();
-			char file_name[100];
-			sprintf(file_name, "out/img%d.jpg\n", file_number++);
-			save(file_name, elec_fld);
-			cudaMemcpy(elec_fld, elec_fld_d, sizeof(complex) * N * N, cudaMemcpyDeviceToHost);
+			complex* efld = new complex[CELLS * CELLS];
+			prop->getElectricField(efld);
+			if(t.joinable())
+				t.join();
+			t = std::thread([efld]()
+			{
+				unsigned char* buffer = render_buffer.getRenderBuffer();
+				unsigned char* display_buffer = render_buffer.getDisplayBuffer();
+				complex* nbuf = new complex[CELLS * CELLS];
+				current_z = prop->getZCoordinate();
+				total_steps = prop->getStepCount();
+				
+				#pragma omp parallel for
+				for(int y = 0; y < CELLS; y++)
+					for(int x = 0; x < CELLS; x++)
+						nbuf[y * CELLS + x] = prop->indexOfRefraction((x - CELLS / 2) * CELL_DIM, (y - CELLS / 2) * CELL_DIM, current_z);
+				
+				#pragma omp parallel for
+				for(int y = 0; y < CELLS; y++)
+				{
+					for(int x = 0; x < CELLS; x++)
+					{
+						unsigned char val = fmin(255.0, 255.0 * thrust::abs(efld[y * CELLS + x]));
+						buffer[y * STRIDE + 4 * x + 0] = 255.0 * (nbuf[y * CELLS + x].real() - 1.0);
+						buffer[y * STRIDE + 4 * x + 1] = val;
+						buffer[y * STRIDE + 4 * x + 2] = val;
+						buffer[y * STRIDE + 4 * x + 3] = 0;
+					}
+					
+					for(int x = CELLS; x < 2 * CELLS - 1; x++)
+					{
+						buffer[y * STRIDE + 4 * x + 0] = display_buffer[y * STRIDE + 4 * (x + 1) + 0];
+						buffer[y * STRIDE + 4 * x + 1] = display_buffer[y * STRIDE + 4 * (x + 1) + 1];
+						buffer[y * STRIDE + 4 * x + 2] = display_buffer[y * STRIDE + 4 * (x + 1) + 2];
+						buffer[y * STRIDE + 4 * x + 3] = display_buffer[y * STRIDE + 4 * (x + 1) + 3];
+					}
+					
+					unsigned char val = fmin(255.0, 255.0 * thrust::abs(efld[y * CELLS + (CELLS / 2)]));
+					buffer[y * STRIDE + 8 * (CELLS - 1) + 0] = 255.0 * (nbuf[y * CELLS + (CELLS / 2)].real() - 1.0);
+					buffer[y * STRIDE + 8 * (CELLS - 1) + 1] = val;
+					buffer[y * STRIDE + 8 * (CELLS - 1) + 2] = val;
+					buffer[y * STRIDE + 8 * (CELLS - 1) + 3] = 0;
+				}
+				render_buffer.swapBuffers();
+				changed = true;
+				delete[] nbuf;
+				delete[] efld;
+			});
 		}
-			
+		count++;
 	}
-	double end = prof_time();
-	std::cout << (end - start) << std::endl;
-	cufftDestroy(plan);
-	cudaFree(elec_fft_d);
-	cudaFree(elec_fft_d);
-	delete[] elec_fld;
+	if(t.joinable())
+		t.join();
+}
+
+GtkWidget* drawing_area;
+cairo_surface_t* s = nullptr;
+gboolean update_surface()
+{
+	if(!changed)
+		return TRUE;
+	changed = false;
+	if(s) cairo_surface_destroy(s);
+	s = cairo_image_surface_create_for_data(render_buffer.getDisplayBuffer(), CAIRO_FORMAT_RGB24, 2 * CELLS, CELLS, STRIDE);
+	gtk_widget_queue_draw(GTK_WIDGET(drawing_area));
+
+	return TRUE;
+}
+
+double start;
+gboolean draw(GtkWidget* widget, cairo_t* cr, gpointer data)
+{
+	guint width, height;
+	
+	width = gtk_widget_get_allocated_width(widget);
+	height = gtk_widget_get_allocated_height(widget);
+	
+	cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
+	cairo_rectangle(cr, 0.0, 0.0, width, height);
+	cairo_fill(cr);
+	
+	real scale = fmin(2 * CELLS > width ? (real)width / (2 * CELLS) : 1.0, CELLS > height ? (real)height / CELLS : 1.0);
+	
+	cairo_scale(cr, scale, scale);
+	if(s) cairo_set_source_surface(cr, s, 0.0, 0.0);
+	
+	cairo_paint(cr);
+	cairo_set_source_rgb(cr, 1.0, 0.0, 0.0);
+	cairo_scale(cr, 1.0 / scale, 1.0 / scale);
+	
+	real yoff = 0.0;
+	auto cairo_print = [&](const char* text)
+	{
+		cairo_text_extents_t te;
+		cairo_text_extents (cr, text, &te);
+		cairo_move_to(cr, 1.0, yoff + te.height + 1.0);
+		cairo_show_text(cr, text);
+		yoff += te.height + 1.0;
+	};
+	
+	char text[200];
+	sprintf(text, "%0.6lf m", current_z);
+	cairo_print(text);
+	
+	sprintf(text, "%d steps", total_steps);
+	cairo_print(text);
+	
+	sprintf(text, "%llu s run time", (unsigned long long)(prof_time()  - start));
+	cairo_print(text);
+	
+	sprintf(text, "%d steps / min", (int)(total_steps / ((prof_time()  - start) / 60.0)));
+	cairo_print(text);
+	
+	sprintf(text, "%0.1lf x %0.1lf um", prop->getPhysicalGridDim() * 1.0e6, prop->getPhysicalGridDim() * 1.0e6);
+	cairo_print(text);
+
+	if(LAMBDA < 1.0e-6)
+		sprintf(text, "Wavelength %0.1lf nm", LAMBDA * 1.0e9);
+	else
+		sprintf(text, "Wavelength %0.1lf um", LAMBDA * 1.0e6);
+	cairo_print(text);
+	return FALSE;
+}
+
+int main(int argc, char** argv)
+{
+	using namespace fftbpm;
+	cudaSetDevice(1);
+	start = prof_time();
+	gtk_init(&argc, &argv);
+	
+	GtkWidget* window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+	int swidth = gdk_screen_get_height(gdk_screen_get_default());
+	int sheight = gdk_screen_get_height(gdk_screen_get_default());
+	int width = 2 * CELLS;
+	int height = CELLS;
+	
+	while(width > swidth && height > sheight)
+	{
+		width /= 2;
+		height /= 2;
+	}
+	
+	gtk_window_set_default_size(GTK_WINDOW(window), width, height);
+	g_signal_connect(window, "destroy", gtk_main_quit, NULL);
+	
+	drawing_area = gtk_drawing_area_new();
+	gtk_container_add(GTK_CONTAINER(window), drawing_area);
+	g_signal_connect(drawing_area, "draw", G_CALLBACK(draw), NULL);
+
+	
+	prop = new fftbpm::BeamPropagator<real, OpticalPath>(CELLS, LAMBDA, CELL_DIM, 0.0, op);
+	prop->setMaxNChange(MAX_N_CHANGE);
+	complex* efld = new complex[CELLS * CELLS];
+	for(int y = 0; y < CELLS; y++)
+	{
+		for(int x = 0; x < CELLS; x++)
+		{
+			int dx = x - CELLS / 2;
+			int dy = y - CELLS / 2;
+			efld[y * CELLS + x] = std::exp(-(dx * dx + dy * dy) / 6000.0);
+//			if(dx * dx + dy * dy < 100 * 100)
+//				efld[y * CELLS + x] = 1.0;
+//			else
+//				efld[y * CELLS + x] = 0.0;
+			
+//			int x_prime = x % 100;
+//			int y_prime = y % 100;
+//			
+//			if(x_prime > 20 && x_prime < 80 && y_prime < 80 && y_prime > 20)
+//			{
+//				if(y_prime > 75 || (x_prime > 47 && x_prime < 53))
+//					efld[y * CELLS + x] = 1.0;
+//				else
+//					efld[y * CELLS + x] = 0.0;
+//			}
+//			else
+//				efld[y * CELLS + x] = 0.0;
+//			
+//			real dx = CELL_DIM * (x - CELLS / 2);
+//			real dy = CELL_DIM * (y - CELLS / 2);
+//			real r = sqrt(dx * dx + dy * dy);
+//			real f = 0.005;
+//			int n = 2 * (sqrt(r * r + f * f) - f) / LAMBDA;
+//			efld[y * CELLS + x] = n % 2 && n < 6;
+			
+//			if(x > 400 && x < 600 && y > 490 && y < 500)
+//				efld[y * CELLS + x] = 1.0;
+//			else
+//				efld[y * CELLS + x] = 0.0;
+			
+//			efld[y * CELLS + x] = 1.0;
+		}
+	}
+	prop->setElectricField(efld);
+	delete[] efld;
+	
+	gtk_widget_show_all(window);
+	
+	g_idle_add((GSourceFunc)update_surface, NULL);
+	
+	std::thread t(stepper_thread);
+	
+	gtk_main();
+	quit_thread = true;
+	t.join();
+	delete prop;
 	return 0;
 }
